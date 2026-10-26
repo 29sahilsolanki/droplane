@@ -1,0 +1,328 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  CUSTOMER
+  VENDOR
+  ADMIN
+}
+
+enum VendorStatus {
+  PENDING
+  APPROVED
+  SUSPENDED
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED // Soft delete: hidden from the shop but kept for order history
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+enum FulfillmentStatus {
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model User {
+  id      String  @id @default(cuid())
+  auth0Id String  @unique
+  email   String  @unique
+  name    String?
+  role    Role    @default(CUSTOMER)
+
+  vendor    Vendor?
+  addresses Address[]
+  orders    Order[]
+  reviews   Review[]
+  cart      Cart?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Vendor {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  storeName   String       @unique
+  slug        String       @unique
+  description String?
+  logoUrl     String?
+  status      VendorStatus @default(PENDING)
+  commission  Decimal      @default(10.00) @db.Decimal(5, 2) // Platform fee percentage (e.g., 10%)
+
+  products  Product[]
+  subOrders VendorOrder[]
+  payouts   Payout[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Category {
+  id       String     @id @default(cuid())
+  name     String
+  slug     String     @unique
+  parentId String?
+  parent   Category?  @relation("SubCategories", fields: [parentId], references: [id])
+  children Category[] @relation("SubCategories")
+  products Product[]
+
+  @@index([parentId])
+}
+
+model Product {
+  id         String    @id @default(cuid())
+  vendorId   String
+  vendor     Vendor    @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  title       String
+  slug        String        @unique
+  description String
+  images      String[]
+  status      ProductStatus @default(DRAFT)
+
+  variants ProductVariant[]
+  reviews  Review[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([vendorId])
+  @@index([categoryId])
+  @@index([status])
+}
+
+model ProductVariant {
+  id        String  @id @default(cuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  sku       String   @unique
+  title     String // e.g. "Size L / Blue"
+  price     Decimal  @db.Decimal(10, 2)
+  compareAt Decimal? @db.Decimal(10, 2)
+  stock     Int      @default(0) // Decrement atomically at checkout to avoid overselling
+
+  orderItems OrderItem[]
+  cartItems  CartItem[]
+
+  @@index([productId])
+}
+
+model Address {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  fullName  String
+  line1     String
+  line2     String?
+  city      String
+  county    String?
+  postcode  String
+  country   String  @default("GB")
+  phone     String?
+  isDefault Boolean @default(false)
+
+  @@index([userId])
+}
+
+model Cart {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  items CartItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CartItem {
+  id        String         @id @default(cuid())
+  cartId    String
+  cart      Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  quantity Int @default(1)
+
+  @@unique([cartId, variantId])
+  @@index([variantId])
+}
+
+// Master Order placed by the customer
+model Order {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  // Shipping address copied at checkout so later edits to the Address book do not change history
+  shipName     String
+  shipLine1    String
+  shipLine2    String?
+  shipCity     String
+  shipPostcode String
+  shipPhone    String?
+
+  currency        String      @default("GBP")
+  subtotal        Decimal     @db.Decimal(10, 2)
+  shippingTotal   Decimal     @default(0) @db.Decimal(10, 2)
+  vatTotal        Decimal     @default(0) @db.Decimal(10, 2)
+  totalAmount     Decimal     @db.Decimal(10, 2)
+  status          OrderStatus @default(PENDING)
+  paymentIntentId String?     @unique // Stripe/Razorpay reference
+
+  vendorOrders VendorOrder[] // Split by vendor
+  refunds      Refund[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+// Sub-Order dedicated to a specific vendor for fulfillment & payouts
+model VendorOrder {
+  id       String  @id @default(cuid())
+  orderId  String
+  order    Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  vendorId String
+  vendor   Vendor  @relation(fields: [vendorId], references: [id])
+  payoutId String?
+  payout   Payout? @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+
+  subtotal          Decimal           @db.Decimal(10, 2)
+  shippingCost      Decimal           @default(0) @db.Decimal(10, 2)
+  commissionRate    Decimal           @db.Decimal(5, 2) // Vendor.commission at the time of the order
+  commissionFee     Decimal           @db.Decimal(10, 2)
+  netPayoutAmount   Decimal           @db.Decimal(10, 2)
+  fulfillmentStatus FulfillmentStatus @default(PROCESSING)
+
+  trackingNumber String?
+  items          OrderItem[]
+  refunds        Refund[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([vendorId])
+  @@index([payoutId])
+}
+
+model OrderItem {
+  id            String          @id @default(cuid())
+  vendorOrderId String
+  vendorOrder   VendorOrder     @relation(fields: [vendorOrderId], references: [id], onDelete: Cascade)
+  variantId     String?
+  variant       ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  // Product details copied at checkout so vendor edits do not change history
+  productTitle String
+  variantTitle String
+  sku          String
+
+  quantity   Int
+  unitPrice  Decimal @db.Decimal(10, 2)
+  totalPrice Decimal @db.Decimal(10, 2)
+
+  review Review?
+
+  @@index([vendorOrderId])
+  @@index([variantId])
+}
+
+model Payout {
+  id       String @id @default(cuid())
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
+
+  amount    Decimal      @db.Decimal(10, 2)
+  status    PayoutStatus @default(PENDING)
+  reference String? // Bank transfer transaction ID
+
+  vendorOrders VendorOrder[] // The sub orders this payout settles
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([vendorId])
+}
+
+model Refund {
+  id            String       @id @default(cuid())
+  orderId       String
+  order         Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  vendorOrderId String?
+  vendorOrder   VendorOrder? @relation(fields: [vendorOrderId], references: [id], onDelete: SetNull)
+
+  amount           Decimal      @db.Decimal(10, 2)
+  reason           String?
+  status           RefundStatus @default(PENDING)
+  providerRefundId String?      @unique // Stripe/Razorpay refund reference
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([vendorOrderId])
+}
+
+model Review {
+  id          String     @id @default(cuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  productId   String
+  product     Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItemId String?    @unique // Set when the review is a verified purchase
+  orderItem   OrderItem? @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+
+  rating    Int // 1 to 5, validated in the GraphQL resolver
+  comment   String?
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId])
+  @@index([productId])
+}
